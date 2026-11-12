@@ -1,0 +1,714 @@
+from __future__ import annotations
+
+import hashlib
+import secrets
+from base64 import b64encode
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
+
+import requests
+from asn1crypto import algos, cms, keys, ocsp, pem, tsp, util, x509
+from cryptography import x509 as cryptography_x509
+from cryptography.hazmat import backends
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, utils
+from cryptography.x509 import ocsp as cryptography_ocsp
+
+from endesive.exceptions import HashAlgorithmError, SignerError, TimestampError
+
+DEFAULT_HTTP_TIMEOUT = 10
+
+# RFC 3161 section 2.4.2: both statuses carry a time-stamp token
+TSP_GRANTED_STATUSES = frozenset(("granted", "granted_with_mods"))
+
+
+def tsp_granted(response: tsp.TimeStampResp) -> bool:
+    """Tell whether a TSA granted the time-stamp request.
+
+    Args:
+        response: Parsed time-stamp response.
+
+    Returns:
+        True for ``granted`` and ``granted_with_mods``; otherwise False.
+    """
+    try:
+        return response["status"]["status"].native in TSP_GRANTED_STATUSES
+    except ValueError:
+        # a refusal carries no timeStampToken, which asn1crypto requires
+        return False
+
+
+def is_tsp_reply(content_type: str | None) -> bool:
+    """Tell whether an HTTP Content-Type is a time-stamp reply (RFC 3161 3.4).
+
+    Args:
+        content_type: Value of the Content-Type header, or None.
+
+    Returns:
+        True for ``application/timestamp-reply``, ignoring letter case and
+        parameters such as a charset.
+    """
+    if content_type is None:
+        return False
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type == "application/timestamp-reply"
+
+
+def check_tsp_reply(response: tsp.TimeStampResp, request: tsp.TimeStampReq) -> None:
+    """Check that a granted time-stamp reply answers ``request``.
+
+    RFC 3161 section 2.4.2 requires the token to carry the message imprint
+    and nonce of the request; replies which are not granted are left to the
+    caller.
+
+    Args:
+        response: Parsed time-stamp response.
+        request: The request it answers.
+
+    Raises:
+        TimestampError: If the token is malformed or answers another request.
+    """
+    if not tsp_granted(response):
+        return
+    try:
+        token = response["time_stamp_token"]
+        tst_info = token["content"]["encap_content_info"]["content"].parsed
+        imprint = tst_info["message_imprint"]
+        algorithm = imprint["hash_algorithm"]["algorithm"].dotted
+        hashed_message = imprint["hashed_message"].native
+        nonce = tst_info["nonce"].native
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise TimestampError("Invalid time-stamp token") from exc
+    requested = request["message_imprint"]
+    if (
+        algorithm != requested["hash_algorithm"]["algorithm"].dotted
+        or hashed_message != requested["hashed_message"].native
+    ):
+        raise TimestampError("Time-stamp token is for another message imprint")
+    if request["nonce"].native is not None and nonce != request["nonce"].native:
+        raise TimestampError("Time-stamp token nonce does not match the request")
+
+
+def cert2asn(
+    cert: x509.Certificate | cryptography_x509.Certificate | bytes,
+) -> x509.Certificate:
+    """Convert a certificate object to the asn1crypto representation.
+
+    Args:
+        cert: Certificate value as asn1crypto, cryptography, or raw bytes.
+
+    Returns:
+        The certificate as an asn1crypto ``x509.Certificate`` instance.
+    """
+    if isinstance(cert, x509.Certificate):
+        return cert
+    if isinstance(cert, cryptography_x509.Certificate):
+        data: bytes = cert.public_bytes(serialization.Encoding.DER)
+    else:
+        data = cert
+    if pem.detect(data):
+        data = pem.unarmor(data)[2]
+    return x509.Certificate.load(data)
+
+
+def extract_ocsp_url_from_cert(
+    cert: cryptography_x509.Certificate | x509.Certificate | bytes,
+) -> str | None:
+    """Extract the OCSP responder URL from a certificate.
+
+    Args:
+        cert: Certificate object or raw certificate bytes.
+
+    Returns:
+        The OCSP URL if present; otherwise ``None``.
+    """
+    if hasattr(cert, "public_bytes"):
+        crypto_cert = cert  # type: ignore
+    else:
+        if hasattr(cert, "dump"):
+            cert_bytes_data: bytes = cert.dump()  # type: ignore
+        else:
+            cert_bytes_data = cert  # type: ignore
+        crypto_cert = cryptography_x509.load_der_x509_certificate(
+            cert_bytes_data, backends.default_backend()
+        )
+    try:
+        aia = crypto_cert.extensions.get_extension_for_oid(
+            cryptography_x509.oid.ExtensionOID.AUTHORITY_INFORMATION_ACCESS
+        )
+        for access_description in aia.value:
+            if (
+                access_description.access_method
+                == cryptography_x509.oid.AuthorityInformationAccessOID.OCSP
+            ):
+                return access_description.access_location.value  # type: ignore
+    except cryptography_x509.ExtensionNotFound:
+        return None
+    return None
+
+
+def fetch_ocsp_response(
+    cert: x509.Certificate | cryptography_x509.Certificate,
+    url: str,
+    ocspoptions: dict[str, Any] | None = None,
+) -> bytes | None:
+    """Fetch an OCSP response for the supplied certificate pair.
+
+    Args:
+        cert: The certificate to validate.
+        url: OCSP responder URL.
+        ocspoptions: Optional OCSP request options.
+
+    Returns:
+        Raw OCSP response bytes or ``None`` if the request fails.
+    """
+    if hasattr(cert, "dump"):
+        cert_bytes_data: bytes = cert.dump()  # type: ignore
+        cert_crypto: cryptography_x509.Certificate = (
+            cryptography_x509.load_der_x509_certificate(
+                cert_bytes_data, backends.default_backend()
+            )
+        )
+    else:
+        cert_crypto = cert  # type: ignore
+
+    ocspoptions = dict(ocspoptions or {}).copy()
+
+    issuer_crypto: cryptography_x509.Certificate
+    issuer = ocspoptions.pop("issuer", None)
+    if issuer is None:
+        return None
+    if hasattr(issuer, "dump"):
+        issuer_bytes_data: bytes = issuer.dump()  # type: ignore
+        issuer_crypto = cryptography_x509.load_der_x509_certificate(
+            issuer_bytes_data, backends.default_backend()
+        )
+    else:
+        issuer_crypto = issuer  # type: ignore
+
+    builder = cryptography_ocsp.OCSPRequestBuilder()
+    builder = builder.add_certificate(cert_crypto, issuer_crypto, hashes.SHA1())
+    req = builder.build()
+    data = req.public_bytes(serialization.Encoding.DER)
+    try:
+        ocspoptions.setdefault("timeout", DEFAULT_HTTP_TIMEOUT)
+        response = requests.post(
+            url,
+            headers={"Content-Type": "application/ocsp-request"},
+            data=data,
+            **ocspoptions,
+        )
+        if response.status_code != 200:
+            return None
+        return response.content
+    except requests.exceptions.RequestException:
+        return None
+
+
+def fetch_tsp_response(
+    unhashed: bytes,
+    hashalgo: str,
+    url: str,
+    reqoptions: dict[str, Any] | None,
+    prehashed: bytes | None = None,
+) -> bytes | None:
+    """Request a timestamp token from a TSA server.
+
+    Args:
+        unhashed: Data to timestamp.
+        hashalgo: Hash algorithm name.
+        url: Timestamp authority URL.
+        reqoptions: Optional request options passed to the HTTP client.
+        prehashed: Precomputed hash value to use instead of hashing ``unhashed``.
+
+    Returns:
+        Raw TSP response bytes or ``None`` if the request fails.
+
+    Raises:
+        TimestampError: If the response cannot be parsed, or a granted
+            response answers another request.
+    """
+    if prehashed:
+        hashed_value = prehashed
+    else:
+        hashed_value = getattr(hashlib, hashalgo)(unhashed).digest()
+    request = tsp.TimeStampReq(
+        {
+            "version": 1,
+            "message_imprint": tsp.MessageImprint(
+                {
+                    "hash_algorithm": algos.DigestAlgorithm({"algorithm": hashalgo}),
+                    "hashed_message": hashed_value,
+                }
+            ),
+            "nonce": secrets.randbits(64),
+            "cert_req": True,
+        }
+    )
+    tspreq = request.dump()
+    tspheaders = {"Content-Type": "application/timestamp-query"}
+    reqoptions = dict(reqoptions or {}).copy()
+    if reqoptions.get("username") is not None:
+        username = reqoptions.pop("username", None)
+        password = reqoptions.pop("password", None)
+        if username and password:
+            auth_header_value = b64encode(
+                bytes(username + ":" + password, "utf-8")
+            ).decode("ascii")
+            tspheaders["Authorization"] = f"Basic {auth_header_value}"
+    reqoptions.setdefault("timeout", DEFAULT_HTTP_TIMEOUT)
+    try:
+        response = requests.post(url, data=tspreq, headers=tspheaders, **reqoptions)
+    except requests.RequestException:
+        return None
+    if response.status_code != 200 or not is_tsp_reply(
+        response.headers.get("Content-Type")
+    ):
+        return None
+    try:
+        reply = tsp.TimeStampResp.load(response.content)
+    except ValueError as exc:
+        raise TimestampError("Invalid timestamp server response") from exc
+    check_tsp_reply(reply, request)
+    return response.content
+
+
+class SignerBase:
+    """CMS Signer - base class for signing operations.
+
+    Parameters:
+        datau: Data to sign (bytes)
+        cert: Signing certificate (asn1crypto x509.Certificate)
+        othercerts: Additional certificates (list of x509.Certificate)
+        hashalgo: Hash algorithm name (str)
+        attrs: Include attributes - bool or callable (default True)
+        signed_value: Pre-computed signature value (bytes)
+        pss: Use PSS padding (bool)
+
+    Raises:
+        SignerError: If attrs is not bool or callable
+        HashAlgorithmError: If the specified hash algorithm is not supported
+
+    Attributes:
+        certificates: List of certificates in ASN.1 format
+        salt_length: Salt length for PSS (int or None)
+        signed_time: Signature timestamp (datetime)
+    """
+
+    def __init__(
+        self,
+        datau: bytes,
+        cert: x509.Certificate,
+        othercerts: list[x509.Certificate | cryptography_x509.Certificate | bytes],
+        hashalgo: str,
+        attrs: bool | Callable[..., Any] = True,
+        signed_value: bytes | None = None,
+        pss: bool = False,
+    ) -> None:
+        if attrs is not True and attrs is not False and not callable(attrs):
+            raise SignerError("attrs must be bool or callable")
+
+        self.datau: bytes = datau
+        self.cert: x509.Certificate = cert
+        certificates: list[x509.Certificate] = []
+        certificates.append(cert)
+        for certo in othercerts:
+            certificates.append(cert2asn(certo))
+        self.othercerts: list[x509.Certificate] = certificates
+        self.hashalgo: str = hashalgo.lower()
+        self.attrs: bool | Callable[..., Any] = attrs
+        self.pss: bool = pss
+
+        try:
+            hashlib.new(self.hashalgo)
+        except ValueError as exc:
+            raise HashAlgorithmError(f"Unsupported hash algorithm: {hashalgo}") from exc
+        key_algorithm = self.cert.public_key.algorithm
+        if pss and key_algorithm not in ("rsa", "rsassa_pss"):
+            raise SignerError("PSS padding requires an RSA key")
+        if key_algorithm == "ec":
+            # fail early on hashes without an ECDSA signature algorithm
+            self._ecdsa_signature_algorithm()
+        elif key_algorithm == "ed25519":
+            # RFC 8419 section 3.1: signed attributes are digested with SHA-512
+            if self.hashalgo != "sha512":
+                raise HashAlgorithmError(
+                    f"Ed25519 signatures require sha512, not {hashalgo}"
+                )
+            if attrs is False:
+                # RFC 8419 permits it, but OpenSSL cannot verify PureEdDSA
+                # over detached content
+                raise SignerError("Ed25519 signatures require signed attributes")
+        elif key_algorithm not in ("rsa", "rsassa_pss"):
+            raise SignerError(f"Unsupported signing key algorithm: {key_algorithm}")
+        self.salt_length: int | None = None if not pss else self.get_pss_salt_length()
+
+        if signed_value is None:
+            signed_value = getattr(hashlib, self.hashalgo)(datau).digest()
+
+        self.signed_value: bytes | None = signed_value
+        self.signed_time: datetime = datetime.now(tz=util.timezone.utc)
+
+    def sign(self, tosign: bytes) -> bytes | None:
+        """Sign data. Override in subclasses.
+
+        Args:
+            tosign: Data to sign
+
+        Returns:
+            Signature bytes or None
+        """
+        return None
+
+    def get_pss_salt_length(self) -> int:
+        """Get PSS salt length. Override in subclasses.
+
+        Returns:
+            Salt length in bytes
+        """
+        return 0
+
+    def get_ocsp_response(self, cert: x509.Certificate) -> bytes | None:
+        """Get OCSP response. Override in subclasses.
+
+        Args:
+            cert: Certificate to check
+
+        Returns:
+            OCSP response bytes or None
+        """
+        return None
+
+    def get_tsp_response(
+        self, signed_value_signature: bytes
+    ) -> list[cms.CMSAttribute] | None:
+        """Get TSP response. Override in subclasses.
+
+        Args:
+            signed_value_signature: Signed data bytes
+
+        Returns:
+            List of CMS attributes or None
+        """
+        return None
+
+    def _ecdsa_signature_algorithm(self) -> algos.SignedDigestAlgorithm:
+        # the algorithm follows the certificate key, as the private key may live
+        # in an HSM or the signature may be computed externally
+        try:
+            return algos.SignedDigestAlgorithm(
+                {"algorithm": algos.SignedDigestAlgorithmId(f"{self.hashalgo}_ecdsa")}
+            )
+        except ValueError as exc:
+            raise HashAlgorithmError(
+                f"Unsupported hash algorithm for ECDSA: {self.hashalgo}"
+            ) from exc
+
+    def build(self) -> dict[str, Any]:
+        """Build CMS signer structure.
+
+        Returns:
+            Dictionary with signer information
+        """
+        signer = {
+            "version": "v1",
+            "sid": cms.SignerIdentifier(
+                {
+                    "issuer_and_serial_number": cms.IssuerAndSerialNumber(
+                        {
+                            "issuer": self.cert.issuer,
+                            "serial_number": self.cert.serial_number,
+                        }
+                    ),
+                }
+            ),
+            "digest_algorithm": algos.DigestAlgorithm({"algorithm": self.hashalgo}),
+            "signature": self.signed_value,
+        }
+
+        if self.cert.public_key.algorithm == "ec":
+            signer["signature_algorithm"] = self._ecdsa_signature_algorithm()
+        elif self.cert.public_key.algorithm == "ed25519":
+            signer["signature_algorithm"] = algos.SignedDigestAlgorithm(
+                {"algorithm": "ed25519"}
+            )
+        elif self.pss:
+            signer["signature_algorithm"] = algos.SignedDigestAlgorithm(
+                {
+                    "algorithm": "rsassa_pss",
+                    "parameters": algos.RSASSAPSSParams(
+                        {
+                            "hash_algorithm": algos.DigestAlgorithm(
+                                {"algorithm": self.hashalgo.lower()}
+                            ),
+                            "mask_gen_algorithm": algos.MaskGenAlgorithm(
+                                {
+                                    "algorithm": algos.MaskGenAlgorithmId("mgf1"),
+                                    "parameters": {
+                                        "algorithm": algos.DigestAlgorithmId(
+                                            self.hashalgo.lower()
+                                        ),
+                                    },
+                                }
+                            ),
+                            "salt_length": algos.Integer(self.salt_length),
+                            "trailer_field": algos.TrailerField(1),
+                        }
+                    ),
+                }
+            )
+        else:
+            signer["signature_algorithm"] = algos.SignedDigestAlgorithm(
+                {"algorithm": "rsassa_pkcs1v15"}
+            )
+
+        if self.attrs is True:
+            signing_certificate2 = cms.CMSAttribute(
+                {
+                    "type": cms.CMSAttributeType("signing_certificate_v2"),
+                    "values": [
+                        tsp.SigningCertificateV2(
+                            {
+                                "certs": [
+                                    tsp.ESSCertIDv2(
+                                        {
+                                            "hash_algorithm": algos.DigestAlgorithm(
+                                                {"algorithm": "sha256"}
+                                            ),
+                                            "cert_hash": hashlib.sha256(
+                                                self.cert.dump()
+                                            ).digest(),
+                                            "issuer_serial": tsp.IssuerSerial(
+                                                {
+                                                    "issuer": (
+                                                        x509.GeneralName(
+                                                            {
+                                                                "directory_name": self.cert.issuer,
+                                                            }
+                                                        ),
+                                                    ),
+                                                    "serial_number": self.cert.serial_number,
+                                                }
+                                            ),
+                                        }
+                                    ),
+                                ]
+                            }
+                        ),
+                    ],
+                }
+            )
+
+            signer["signed_attrs"] = [
+                cms.CMSAttribute(
+                    {
+                        "type": cms.CMSAttributeType("content_type"),
+                        "values": ("data",),
+                    }
+                ),
+                cms.CMSAttribute(
+                    {
+                        "type": cms.CMSAttributeType("message_digest"),
+                        "values": (self.signed_value,),
+                    }
+                ),
+                # cms.CMSAttribute(
+                #    {
+                #        "type": cms.CMSAttributeType("signing_time"),
+                #        "values": (cms.Time({"utc_time": core.UTCTime(signed_time)}),),
+                #    }
+                # ),
+                signing_certificate2,
+            ]
+        elif callable(self.attrs):
+            signer["signed_attrs"] = self.attrs(self.signed_value)
+
+        config = {
+            "version": "v1",
+            "digest_algorithms": cms.DigestAlgorithms(
+                (algos.DigestAlgorithm({"algorithm": self.hashalgo}),)
+            ),
+            "encap_content_info": {
+                "content_type": "data",
+            },
+            "certificates": self.othercerts,
+            "signer_infos": [
+                signer,
+            ],
+        }
+        ocsp_response = self.get_ocsp_response(self.cert)
+        if ocsp_response:
+            other = cms.RevocationInfoChoice(
+                {
+                    "other": cms.OtherRevocationInfoFormat(
+                        {
+                            "other_rev_info_format": cms.OtherRevInfoFormatId(
+                                "ocsp_response"
+                            ),
+                            "other_rev_info": ocsp_response,
+                        }
+                    )
+                }
+            )
+            config["crls"] = cms.RevocationInfoChoices([other])
+
+        datas = cms.ContentInfo(
+            {
+                "content_type": cms.ContentType("signed_data"),
+                "content": cms.SignedData(config),
+            }
+        )
+        if self.attrs is False:
+            tosign = self.datau
+        else:
+            tosign = datas["content"]["signer_infos"][0]["signed_attrs"].dump()
+            tosign = b"\x31" + tosign[1:]
+
+        signed_value_signature = self.sign(tosign)
+        # signed_value_signature = core.OctetString(signed_value_signature)
+        datas["content"]["signer_infos"][0]["signature"] = signed_value_signature
+
+        unsigned_attrs = []
+        tspresponse = self.get_tsp_response(signed_value_signature)
+        if tspresponse is not None:
+            if not tsp_granted(tspresponse):
+                raise TimestampError("Timestamp request was not granted")
+            unsigned_attrs.append(
+                cms.CMSAttribute(
+                    {
+                        "type": cms.CMSAttributeType("signature_time_stamp_token"),
+                        "values": cms.SetOfContentInfo(
+                            [
+                                cms.ContentInfo(
+                                    {
+                                        "content_type": cms.ContentType("signed_data"),
+                                        "content": tspresponse["time_stamp_token"][
+                                            "content"
+                                        ],
+                                    }
+                                )
+                            ]
+                        ),
+                    }
+                )
+            )
+        if unsigned_attrs:
+            datas["content"]["signer_infos"][0]["unsigned_attrs"] = unsigned_attrs
+
+        # open('signed-content-info', 'wb').write(datas.dump())
+        return datas.dump()
+
+
+class Signer(SignerBase):
+    def __init__(
+        self,
+        datau: bytes,
+        key: Any,
+        cert: x509.Certificate | cryptography_x509.Certificate | bytes,
+        othercerts: list[x509.Certificate | cryptography_x509.Certificate],
+        hashalgo: str,
+        attrs: bool | Callable[..., Any] = True,
+        signed_value: bytes | None = None,
+        hsm: Any = None,
+        pss: bool = False,
+        tspurl: str | None = None,
+        tspoptions: dict | None = None,
+        ocspurl: str | None = None,
+        ocspoptions: dict | None = None,
+    ):
+        if hsm is not None:
+            key, cert = hsm.certificate()
+        cert = cert2asn(cert)
+        self.key = key
+        self.hsm = hsm
+        self.tspurl = tspurl
+        self.tspoptions = tspoptions
+        self.ocspurl = ocspurl
+        self.ocspoptions = ocspoptions
+        super().__init__(datau, cert, othercerts, hashalgo, attrs, signed_value, pss)
+
+    def get_pss_salt_length(self) -> int:
+        md = getattr(hashes, self.hashalgo.upper())
+        if self.key is None or isinstance(self.key, keys.PrivateKeyInfo):
+            return md.digest_size
+        return padding.calculate_max_pss_salt_length(self.key, md)
+
+    def get_ocsp_response(self, cert):
+        if self.ocspurl:
+            response = fetch_ocsp_response(cert, self.ocspurl, self.ocspoptions)
+            if response:
+                return ocsp.OCSPResponse.load(response)
+        return None
+
+    def get_tsp_response(self, signed_value_signature):
+        if not self.tspurl:
+            return None
+        response = fetch_tsp_response(
+            signed_value_signature,
+            self.hashalgo,
+            self.tspurl,
+            self.tspoptions,
+        )
+        if response is None:
+            raise TimestampError("No response from timestamp server")
+        return tsp.TimeStampResp.load(response)
+
+    def sign(self, tosign):
+        if self.hsm is not None:
+            signed_value_signature = self.hsm.sign(self.key, tosign, self.hashalgo)
+        elif self.pss:
+            md = getattr(hashes, self.hashalgo.upper())
+            digest = hashes.Hash(md(), backend=backends.default_backend())
+            digest.update(tosign)
+            digest = digest.finalize()
+            signed_value_signature = self.key.sign(
+                digest,
+                padding.PSS(mgf=padding.MGF1(md()), salt_length=self.salt_length),
+                utils.Prehashed(md()),
+            )
+        elif isinstance(self.key, ed25519.Ed25519PrivateKey):
+            # PureEdDSA: the hash is part of the algorithm
+            signed_value_signature = self.key.sign(tosign)
+        elif isinstance(self.key, ec.EllipticCurvePrivateKey):
+            signed_value_signature = self.key.sign(
+                tosign, ec.ECDSA(getattr(hashes, self.hashalgo.upper())())
+            )
+        else:
+            signed_value_signature = self.key.sign(
+                tosign, padding.PKCS1v15(), getattr(hashes, self.hashalgo.upper())()
+            )
+        return signed_value_signature
+
+
+def sign(
+    datau: bytes,
+    key: Any,
+    cert: x509.Certificate | cryptography_x509.Certificate | bytes,
+    othercerts: list[x509.Certificate | cryptography_x509.Certificate | bytes],
+    hashalgo: str,
+    attrs: bool | Callable[..., Any] = True,
+    signed_value: bytes | None = None,
+    hsm: Any = None,
+    pss: bool = False,
+    tspurl: str | None = None,
+    tspoptions: dict | None = None,
+    ocspurl: str | None = None,
+    ocspoptions: dict | None = None,
+):
+    cls = Signer(
+        datau,
+        key,
+        cert,
+        othercerts,
+        hashalgo,
+        attrs,
+        signed_value,
+        hsm,
+        pss,
+        tspurl,
+        tspoptions,
+        ocspurl,
+        ocspoptions,
+    )
+    return cls.build()

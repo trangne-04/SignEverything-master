@@ -1,0 +1,1117 @@
+from __future__ import annotations
+
+import codecs
+import hashlib
+import io
+import secrets
+import struct
+from typing import Any
+
+from asn1crypto import tsp
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509 import ObjectIdentifier
+from pypdf import PdfReader, PdfWriter, generic as po
+
+from endesive import signer
+from endesive.exceptions import TimestampError
+from endesive.pdf.PyPDF2_annotate.annotations.signature import Signature
+from endesive.pdf.PyPDF2_annotate.config.appearance import Appearance
+from endesive.pdf.PyPDF2_annotate.config.location import Location
+from endesive.pdf.PyPDF2_annotate.util.geometry import identity
+
+
+def _b_(s: str | bytes) -> bytes:
+    """Encode str to bytes (pass bytes through unchanged)."""
+    if isinstance(s, bytes):
+        return s
+    return s.encode("latin-1")
+
+
+def _encode_password(password: str | bytes) -> bytes:
+    if isinstance(password, str):
+        try:
+            pwd = password.encode("latin-1")
+        except Exception:
+            pwd = password.encode("utf-8")  # Fallback logic for wider unicode support
+    else:
+        pwd = password
+    return pwd
+
+
+def _prev_uses_xref_stream(prev: Any) -> bool:
+    """Whether the previous revision's outermost (most recent) cross-
+    reference section is a cross-reference *stream* (PDF 1.5+,
+    ``/Type /XRef``) rather than a classic ``xref`` table.
+
+    This determines which format the newly-appended incremental update
+    should use, matching the format the previous revision was already
+    using. Older PyPDF2 exposed this as ``PdfFileReader.xrefstream``,
+    tracked internally while parsing; pypdf keeps no equivalent flag, so
+    it is recovered here by looking at the marker byte at the previous
+    xref's file offset (``x`` starts a classic ``xref`` table; a digit
+    starts an indirect object holding a cross-reference stream).
+    """
+    stream = prev.stream
+    saved_pos = stream.tell()
+    try:
+        stream.seek(prev._startxref, 0)
+        x = stream.read(1)
+        if x in b"\r\n":
+            x = stream.read(1)
+        return x.isdigit()
+    finally:
+        stream.seek(saved_pos, 0)
+
+
+def _EncodedString(s: str) -> Any:
+    return po.create_string_object(codecs.BOM_UTF16_BE + s.encode("utf-16be"))
+
+
+class _UnencryptedBytes(bytes, po.PdfObject):
+    original_bytes = property(lambda self: self)
+
+    def write_to_stream(self, stream: Any, encryption_key: Any = None) -> None:
+        stream.write(b"<")
+        stream.write(self)
+        stream.write(b">")
+
+
+class _WNumberObject(po.NumberObject):
+    Format = b"%08d"
+
+    def write_to_stream(self, stream: Any, encryption_key: Any = None) -> None:
+        stream.write(self.Format % self)
+
+
+class SignedData(PdfWriter):
+    def _write(self, stream, prev, startdata):
+        stream.write(_b_("\r\n"))
+        positions = {}
+        for i in range(len(self._objects)):
+            idnum = i + 1
+            obj = self._objects[i]
+            if obj is None:
+                positions[idnum] = 0
+                continue
+            positions[idnum] = startdata + stream.tell()
+            stream.write(_b_(str(idnum) + " 0 obj\n"))
+            if prev.is_encrypted:
+                obj = prev._encryption.encrypt_object(obj, idnum, 0)
+            obj.write_to_stream(stream)
+            stream.write(_b_("\nendobj\n"))
+
+        xref_location = startdata + stream.tell()
+        xrefstream = _prev_uses_xref_stream(prev)
+        if not xrefstream:
+            trailer = po.DictionaryObject()
+        else:
+            trailer = po.StreamObject()
+            self._add_object(trailer)
+        # xref table
+        trailer.update(
+            {
+                po.NameObject("/Size"): po.NumberObject(len(self._objects) + 1),
+                po.NameObject("/Root"): self.x_root,
+                po.NameObject("/Prev"): po.NumberObject(prev._startxref),
+                po.NameObject("/ID"): self._ID,
+            }
+        )
+
+        if prev.is_encrypted:
+            trailer[po.NameObject("/Encrypt")] = prev.trailer.raw_get("/Encrypt")
+
+        if self.x_info:
+            trailer[po.NameObject("/Info")] = self.x_info
+
+        if not xrefstream:
+            stream.write(_b_("xref\n"))
+            positions[0] = 1
+            keys = sorted(positions.keys())
+            i = 0
+            while i < len(keys):
+                start = i
+                while i < len(keys) and positions[keys[i]] != 0:
+                    i += 1
+                stream.write(_b_("%d %d \n" % (keys[start], i - start)))
+                i = start
+                while i < len(keys) and positions[keys[i]] != 0:
+                    if i == 0:
+                        stream.write(_b_("0000000000 65535 f \n"))
+                    else:
+                        stream.write(_b_("%010d %05d n \n" % (positions[keys[i]], 0)))
+                    i += 1
+                while i < len(keys) and positions[keys[i]] == 0:
+                    i += 1
+
+            # trailer
+            stream.write(_b_("trailer\n"))
+            trailer.write_to_stream(stream, None)
+        else:
+
+            def pack(offset):
+                return struct.pack(">q", offset)
+
+            dataindex = [0, 1]
+            dataxref = [b"\x00" + pack(0)]
+            keys = sorted(positions.keys())
+            i = 0
+            while i < len(keys):
+                off = positions[keys[i]]
+                if off != 0:
+                    start = i
+                    while i < len(keys) and positions[keys[i]] != 0:
+                        dataxref.append(b"\x01" + pack(positions[keys[i]]))
+                        i += 1
+                    dataindex.append(keys[start])
+                    dataindex.append(i - start)
+                else:
+                    i += 1
+            dataxref = b"".join(dataxref)
+            trailer[po.NameObject("/Type")] = po.NameObject("/XRef")
+            trailer[po.NameObject("/W")] = po.ArrayObject(po.NumberObject(x) for x in [1, 8, 0])
+            trailer[po.NameObject("/Index")] = po.ArrayObject(po.NumberObject(x) for x in dataindex)
+            trailer._data = dataxref
+            retval = trailer.flate_encode()
+            trailer.update(retval)
+            trailer._data = retval._data
+            stream.write(_b_("%d 0 obj\n" % (len(self._objects))))
+            trailer.write_to_stream(stream, None)
+            stream.write(_b_("\nendobj"))
+
+        # eof
+        stream.write(_b_("\nstartxref\n%s\n%%%%EOF\n" % (xref_location)))
+
+    def _extend(self, obj):
+        stream = getattr(obj, "stream", None)
+        if stream is not None:
+            # stream data is already encoded as its /Filter says
+            d = {"__streamdata__": stream, "/Length": len(stream)}
+            d.update(obj)
+            dct = po.StreamObject.initialize_from_dictionary(d)
+        else:
+            dct = po.DictionaryObject()
+        for k, v in obj.items():
+            if isinstance(v, po.DictionaryObject):
+                if v.indirect:
+                    v = self._extend(v)
+                    v = self._add_object(v)
+                else:
+                    v = self._extend(v)
+            elif isinstance(v, list):
+                result = po.ArrayObject()
+                for va in v:
+                    if isinstance(va, po.DictionaryObject):
+                        if va.indirect:
+                            va = self._extend(va)
+                            va = self._add_object(va)
+                        else:
+                            va = self._extend(va)
+                    result.append(va)
+                v = result
+            dct[k] = v
+        return dct
+
+    def _make_signature(self, Contents=None, Type=None, SubFilter=None):
+        sig = po.DictionaryObject()
+        sig_ref = self._add_object(sig)
+
+        sig.update(
+            {
+                po.NameObject("/Type"): Type,
+                po.NameObject("/Filter"): po.NameObject("/Adobe.PPKLite"),
+                po.NameObject("/SubFilter"): SubFilter,
+                po.NameObject("/ByteRange"): po.ArrayObject(
+                    [
+                        _WNumberObject(0),
+                        _WNumberObject(0),
+                        _WNumberObject(0),
+                        _WNumberObject(0),
+                    ]
+                ),
+                po.NameObject("/Contents"): Contents,
+            }
+        )
+        return sig, sig_ref
+
+    def _make_sig_annotation(self, F=None, Vref=None, T=None, Pref=None):
+        annot = po.DictionaryObject()
+        annot_ref = self._add_object(annot)
+        annot.update(
+            {
+                po.NameObject("/FT"): po.NameObject("/Sig"),
+                po.NameObject("/Type"): po.NameObject("/Annot"),
+                po.NameObject("/Subtype"): po.NameObject("/Widget"),
+                po.NameObject("/F"): F,
+                po.NameObject("/T"): T,
+                po.NameObject("/V"): Vref,
+                po.NameObject("/P"): Pref,
+                # For an invisible signature, /Rect should be a size 0 box
+                # Defaulting to that
+                po.NameObject("/Rect"): po.ArrayObject(
+                    [
+                        po.FloatObject(0.0),
+                        po.FloatObject(0.0),
+                        po.FloatObject(0.0),
+                        po.FloatObject(0.0),
+                    ]
+                ),
+            }
+        )
+        return annot, annot_ref
+
+    def _addAnnotation(self, cert, udct, box, page0ref, obj13, obj13ref, new_13):
+        x1, y1, x2, y2 = box
+        annotation = Signature(
+            Location(x1=x1, y1=y1, x2=x2, y2=y2, page=0), Appearance()
+        )
+        if "signature" in udct:
+            # Plain text signature with the default font
+            # text to render is contained in udct['signature']
+            # font parameters are in udct['signature']['text']
+            annotationtext = udct["signature"]
+            wrap_text = udct.get("text", {}).get("wraptext", True)
+            font_size = udct.get("text", {}).get("fontsize", 12)
+            text_align = udct.get("text", {}).get("textalign", "left")
+            line_spacing = udct.get("text", {}).get("linespacing", 1.2)
+
+            annotation.add_default_font()
+            annotation.set_signature_appearance(
+                ["fill_colour", 0, 0, 0],
+                ["font", "default", font_size],
+                [
+                    "text_box",
+                    annotationtext,
+                    "default",
+                    0,
+                    0,
+                    x2 - x1,
+                    y2 - y1,
+                    font_size,
+                    wrap_text,
+                    text_align,
+                    "middle",
+                    line_spacing,
+                ],
+            )
+        elif "signature_img" in udct:
+            # Simple image signature, stretches to fit the box
+            # image to render is contained in udct['signature_image']
+            annotation.add_image(udct["signature_img"], "Image")
+            annotation.set_signature_appearance(
+                [
+                    "image",
+                    "Image",
+                    0,
+                    0,
+                    x2 - x1,
+                    y2 - y1,
+                    udct.get("signature_img_distort", True),
+                    udct.get("signature_img_centred", False),
+                ]
+            )
+        elif "signature_appearance" in udct:
+            # Adobe-inspired signature with text and images
+            # Parameters are contained in udct['signature_appearance']
+            # If a field is included in the display list, that field
+            # will be contained in the annotation.
+            #
+            # Text and border are the colour specified by outline,
+            # and border is the the inset distance from the outer
+            # edge of the annotation.  The R G B values range between
+            # 0 and 1.
+            #
+            # Icon is an image to display above the background and
+            # border at the left-hand side of the anntoation.  If
+            # there is no text, it is centred.
+            #
+            # The text block is left-aligned to the right of the icon
+            # image.  If there is no image, the text is left-aliged
+            # with the left-hand border of the annotation
+            #
+            # display fields:
+            #   CN, DN, date, contact, reason, location
+            #
+            # Dict format:
+            #   appearance = dict(
+            #       background = Image with alpha / None,
+            #       icon = Image with alpha / None,
+            #       labels = bool,
+            #       display = list,
+            #       software = str,
+            #       outline = [R, G, B],
+            #       border = int,
+            #       )
+            sig = {}
+            for f in ("background", "icon", "labels", "border", "outline"):
+                if f in udct["signature_appearance"]:
+                    sig[f] = udct["signature_appearance"][f]
+
+            toggles = udct["signature_appearance"].get("display", [])
+            if isinstance(toggles, str):
+                sig["text"] = toggles
+            else:
+                for f in ("contact", "reason", "location", "contact", "signingdate"):
+                    if f in toggles:
+                        sig[f] = udct.get(f, "{} unknown".format(f))
+                if "date" in toggles:
+                    sig["date"] = udct["signingdate"]
+                if "CN" in toggles:
+                    cn = cert.subject.get_attributes_for_oid(
+                        ObjectIdentifier("2.5.4.3")
+                    )
+                    sig["CN"] = cn[0].value if cn else "CN unknown"
+                if "DN" in toggles:
+                    sig["DN"] = cert.subject.rfc4514_string()
+            annotation.simple_signature(sig)
+        else:
+            # Manual signature annotation creation
+            #
+            # Make your own appearance with an arbitrary number of
+            # images and fonts
+            if "manual_images" in udct:
+                for name, img in udct["manual_images"].items():
+                    annotation.add_image(img, name=name)
+            if "manual_fonts" in udct:
+                for name, path in udct["manual_fonts"].items():
+                    annotation.add_ttf_font(path, name=name)
+            annotation.add_default_font()
+            annotation.set_signature_appearance(*udct["signature_manual"])
+
+        pdfa = annotation.as_pdf_object(identity(), page=page0ref)
+        objapn = self._extend(pdfa["/AP"]["/N"])
+        objapnref = self._add_object(objapn)
+
+        objap = po.DictionaryObject()
+        objap[po.NameObject("/N")] = objapnref
+        obj13.update(
+            {
+                po.NameObject("/Rect"): po.ArrayObject(
+                    [
+                        po.FloatObject(x1),
+                        po.FloatObject(y1),
+                        po.FloatObject(x2),
+                        po.FloatObject(y2),
+                    ]
+                ),
+                po.NameObject("/AP"): objap,
+                # po.NameObject("/SM"): po.create_string_object("TabletPOSinline"),
+            }
+        )
+
+        page0 = page0ref.get_object()
+        if new_13:
+            annots = po.ArrayObject([obj13ref])
+            if "/Annots" in page0:
+                page0annots = page0["/Annots"]
+                if isinstance(page0annots, po.IndirectObject):
+                    annots.insert(0, page0annots)
+                elif isinstance(page0annots, po.ArrayObject):
+                    annots = page0annots
+                    annots.append(obj13ref)
+        else:
+            annots = page0["/Annots"]
+        page0.update({po.NameObject("/Annots"): annots})
+        self._objects[page0ref.idnum - 1] = page0
+
+    def _makepdf(
+        self,
+        prev,
+        udct,
+        algomd,
+        zeros,
+        cert,
+        othercerts,
+        ocspurl,
+        ocspoptions,
+        **params,
+    ):
+        catalog = prev.trailer["/Root"]
+        size = prev.trailer["/Size"]
+        pages = catalog["/Pages"].get_object()
+        page0ref = prev.pages[udct.get("sigpage", 0)].indirect_reference
+
+        self._objects = []
+        while len(self._objects) < size - 1:
+            self._objects.append(None)
+
+        if params["mode"] == "timestamp":
+            # deal with extensions
+            if "/Extensions" not in catalog:
+                extensions = po.DictionaryObject()
+            else:
+                extensions = catalog["/Extensions"]
+
+            if "/ESIC" not in extensions:
+                extensions.update(
+                    {
+                        po.NameObject("/ESIC"): po.DictionaryObject(
+                            {
+                                po.NameObject("/BaseVersion"): po.NameObject("/1.7"),
+                                po.NameObject("/ExtensionLevel"): po.NumberObject(1),
+                            }
+                        )
+                    }
+                )
+                catalog.update({po.NameObject("/Extensions"): extensions})
+            else:
+                esic = extensions["/ESIC"]
+                major, minor = esic["/BaseVersion"].lstrip("/").split(".")
+                if int(major) < 1 or int(minor) < 7:
+                    esic.update(
+                        {
+                            po.NameObject("/BaseVersion"): po.NameObject("/1.7"),
+                            po.NameObject("/ExtensionLevel"): po.NumberObject(1),
+                        }
+                    )
+
+            SubFilter = po.NameObject("/ETSI.CAdES.detached")
+        else:
+            SubFilter = po.NameObject("/adbe.pkcs7.detached")
+
+        # obj12 is the digital signature
+        obj12, obj12ref = self._make_signature(
+            Type=po.NameObject("/Sig"),
+            SubFilter=SubFilter,
+            Contents=_UnencryptedBytes(zeros),
+        )
+
+        obj12.update(
+            {
+                po.NameObject("/Prop_Build"): po.DictionaryObject(
+                    {
+                        po.NameObject("/App"): po.DictionaryObject(
+                            {
+                                po.NameObject("/Name"): po.NameObject(
+                                    "/" + udct.get("application", "endesive")
+                                )
+                            }
+                        ),
+                    }
+                ),
+            }
+        )
+
+        if params["mode"] == "timestamp":
+            # obj12 is a timestamp this time
+            obj12.update(
+                {
+                    po.NameObject("/Type"): po.NameObject("/DocTimeStamp"),
+                    po.NameObject("/SubFilter"): po.NameObject("/ETSI.RFC3161"),
+                    po.NameObject("/V"): po.NumberObject(0),
+                }
+            )
+        d12 = {}
+        for k, v in (
+            ("/Name", "name"),
+            ("/Contact", "contact"),
+            ("/Location", "location"),
+            ("/Reason", "reason"),
+        ):
+            v = udct.get(v, None)
+            if v is not None:
+                d12[po.NameObject(k)] = po.create_string_object(v)
+        if params.get("use_signingdate"):
+            d12[po.NameObject("/M")] = po.create_string_object(udct["signingdate"])
+        if d12:
+            obj12.update(d12)
+
+        # obj13 is a combined AcroForm Sig field with Widget annotation
+        new_13 = True
+        # obj13 = po.DictionaryObject()
+        if udct.get("signform", False):
+            # Attaching signature to existing field in AcroForm
+            if "/AcroForm" in catalog:
+                form = catalog["/AcroForm"].get_object()
+                if "/Fields" in form:
+                    fields = form["/Fields"].get_object()
+                    obj13ref = [
+                        f
+                        for f in fields
+                        if f.get_object()["/T"] == udct.get("sigfield", "Signature1")
+                    ][0]
+                    obj13 = obj13ref.get_object()
+                    self._objects[obj13ref.idnum - 1] = obj13
+                    new_13 = False
+
+        # box is coordinates of the annotation to fill
+        box = udct.get("signaturebox", None)
+
+        if new_13:
+            obj13, obj13ref = self._make_sig_annotation(
+                F=po.NumberObject(udct.get("sigflagsft", 132)),
+                T=_EncodedString(udct.get("sigfield", "Signature1")),
+                Vref=obj12ref,
+                Pref=page0ref,
+            )
+        else:
+            # original obj13 is a merged SigField/SigAnnot
+            # Setting /V on the AcroForm field sets the signature
+            # for the field
+            obj13.update({po.NameObject("/V"): obj12ref})
+            # fill the existing signature field annotation,
+            # ignore any other location
+            if "/Rect" in obj13:
+                box = [float(f) for f in obj13["/Rect"]]
+
+        # add an annotation if there is a field to fill
+        if box is not None:
+            self._addAnnotation(cert, udct, box, page0ref, obj13, obj13ref, new_13)
+        else:
+            # invisible signature
+            objap = po.DictionaryObject()
+            objapref = self._add_object(objap)
+            objform = po.DictionaryObject(
+                {
+                    po.NameObject("/Length"): po.NumberObject(0),
+                    po.NameObject("/Type"): po.NameObject("/XObject"),
+                    po.NameObject("/Subtype"): po.NameObject("/Form"),
+                    po.NameObject("/Bbox"): po.ArrayObject(
+                        [
+                            po.FloatObject(0.0),
+                            po.FloatObject(0.0),
+                            po.FloatObject(0.0),
+                            po.FloatObject(0.0),
+                        ]
+                    ),
+                }
+            )
+            objformref = self._add_object(objform)
+            objap.update({po.NameObject("/N"): objformref})
+            obj13.update({po.NameObject("/AP"): objapref})
+
+        if udct.get("sigandcertify", False) and "/Perms" not in catalog:
+            obj10 = po.DictionaryObject()
+            obj10ref = self._add_object(obj10)
+            obj11 = po.DictionaryObject()
+            obj11ref = self._add_object(obj11)
+            obj14 = po.DictionaryObject()
+            obj14ref = self._add_object(obj14)
+            obj14.update({po.NameObject("/DocMDP"): obj12ref})
+            obj10.update(
+                {
+                    po.NameObject("/Type"): po.NameObject("/TransformParams"),
+                    po.NameObject("/P"): po.NumberObject(udct.get("sigflags", 3)),
+                    po.NameObject("/V"): po.NameObject("/1.2"),
+                }
+            )
+            obj11.update(
+                {
+                    po.NameObject("/Type"): po.NameObject("/SigRef"),
+                    po.NameObject("/TransformMethod"): po.NameObject("/DocMDP"),
+                    po.NameObject("/DigestMethod"): po.NameObject("/" + algomd.upper()),
+                    po.NameObject("/TransformParams"): obj10ref,
+                }
+            )
+            obj12[po.NameObject("/Reference")] = po.ArrayObject([obj11ref])
+            catalog[po.NameObject("/Perms")] = obj14ref
+
+        if "/AcroForm" in catalog:
+            form = catalog["/AcroForm"].get_object()
+            if "/Fields" in form:
+                fields = form["/Fields"]
+                old_field_names = [f.get_object()["/T"] for f in fields]
+            else:
+                fields = po.ArrayObject()
+                old_field_names = []
+            if udct.get("auto_sigfield", False) and obj13["/T"] in old_field_names:
+                name_base = udct.get("sigfield", "Signature1")
+                checklist = [
+                    f[len(name_base) :]
+                    for f in old_field_names
+                    if f.startswith(name_base)
+                ]
+                for i in range(1, len(checklist) + 1):
+                    suffix = "_{}".format(i)
+                    if suffix in checklist:
+                        continue
+
+                    new_name = "{}{}".format(name_base, suffix)
+                    obj13.update({po.NameObject("/T"): _EncodedString(new_name)})
+                    break
+
+            old_flags = int(form.get("/SigFlags", 0))
+            new_flags = int(form.get("/SigFlags", 0)) | udct.get("sigflags", 3)
+            if new_13:
+                fields.append(obj13ref)
+                form.update(
+                    {
+                        po.NameObject("/Fields"): fields,
+                        po.NameObject("/SigFlags"): po.NumberObject(new_flags),
+                    }
+                )
+            elif new_flags > old_flags:
+                form.update({po.NameObject("/SigFlags"): po.NumberObject(new_flags)})
+            formref = catalog.raw_get("/AcroForm")
+            if isinstance(formref, po.IndirectObject):
+                self._objects[formref.idnum - 1] = form
+                form = formref
+        else:
+            form = po.DictionaryObject()
+            form.update(
+                {
+                    po.NameObject("/Fields"): po.ArrayObject([obj13ref]),
+                    po.NameObject("/SigFlags"): po.NumberObject(
+                        udct.get("sigflags", 3)
+                    ),
+                }
+            )
+        catalog[po.NameObject("/AcroForm")] = form
+
+        if "/Metadata" in catalog:
+            catalog[po.NameObject("/Metadata")] = catalog.raw_get("/Metadata")
+
+        if udct.get("ltv", False):
+            dss = po.DictionaryObject()
+            vri = po.DictionaryObject()
+            certs = po.ArrayObject()
+            ocsps = po.ArrayObject()
+            crls = po.ArrayObject()
+            dss.update(
+                {
+                    po.NameObject("/Type"): po.NameObject("/DSS"),
+                    po.NameObject("/VRI"): vri,
+                    po.NameObject("/Certs"): certs,
+                    po.NameObject("/OCSPs"): ocsps,
+                    po.NameObject("/CRLs"): crls,
+                }
+            )
+            catalog[po.NameObject("/DSS")] = self._add_object(dss)
+
+            if ocspurl is None:
+                ocspurl = signer.extract_ocsp_url_from_cert(cert)
+            if ocspurl is not None:
+                ocspoptions = ocspoptions or {}
+                ocspissuer = ocspoptions.get("issuer")
+                if ocspissuer is None:
+                    for othercert in othercerts:
+                        if othercert.subject == cert.issuer:
+                            ocspissuer = othercert
+                            break
+                    ocspoptions["issuer"] = ocspissuer
+                ocspresp = signer.fetch_ocsp_response(cert, ocspurl, ocspoptions)
+                if ocspresp is not None:
+                    obj = po.StreamObject()
+                    obj._data = ocspresp
+                    ocsps.append(self._add_object(obj))
+            obj = po.StreamObject()
+            obj._data = cert.public_bytes(serialization.Encoding.DER)
+            certs.append(self._add_object(obj))
+            for cert in othercerts:
+                obj = po.StreamObject()
+                obj._data = cert.public_bytes(serialization.Encoding.DER)
+                certs.append(self._add_object(obj))
+
+        x_root = prev.trailer.raw_get("/Root")
+        self._objects[x_root.idnum - 1] = catalog
+        self.x_root = po.IndirectObject(x_root.idnum, 0, self)
+        self.x_info = prev.trailer.get("/Info")
+
+    def sign(
+        self,
+        datau,
+        udct,
+        key,
+        cert,
+        othercerts,
+        algomd,
+        hsm,
+        tspurl=None,
+        tspoptions=None,
+        mode="sign",
+        ocspurl=None,
+        ocspoptions=None,
+        use_signingdate=True,
+    ):
+        startdata = len(datau)
+
+        fi = io.BytesIO(datau)
+
+        # read end decrypt
+        prev = PdfReader(fi)
+        if prev.is_encrypted:
+            prev.decrypt(udct["password"])
+
+        # digest method must remain unchanged from prevoius signatures
+        obj = prev.trailer
+        for k in ("/Root", "/Perms", "/DocMDP", "/Reference"):
+            if k in obj:
+                obj = obj[k]
+                if isinstance(obj, po.ArrayObject):
+                    obj = obj[0]
+                obj = obj.get_object()
+            else:
+                obj = None
+                break
+        if obj is not None:
+            algomd = obj["/DigestMethod"][1:].lower()
+
+        # produce smaller signatures, but must be signed twice
+        aligned = udct.get(
+            "aligned", 4096 if isinstance(key, ec.EllipticCurvePrivateKey) else 0
+        )
+        if aligned:
+            zeros = b"00" * aligned
+        else:
+            md = getattr(hashlib, algomd)().digest()
+            if mode == "timestamp":
+                if tspurl is None:
+                    raise TimestampError("No timestamp server URL provided")
+                response = signer.fetch_tsp_response(
+                    b"",
+                    algomd,
+                    tspurl,
+                    tspoptions,
+                    prehashed=md,
+                )
+                if response is None:
+                    raise TimestampError("No response from timestamp server")
+                tspresp = tsp.TimeStampResp.load(response)
+                if not signer.tsp_granted(tspresp):
+                    raise TimestampError("Timestamp request was not granted")
+                contents = tspresp["time_stamp_token"].dump()
+            else:
+                attrs = udct.get("attrs", True)
+                pss = udct.get("pss", False)
+                contents = signer.sign(
+                    None,
+                    key,
+                    cert,
+                    othercerts,
+                    algomd,
+                    attrs,
+                    md,
+                    hsm,
+                    pss,
+                    tspurl,
+                    tspoptions,
+                    ocspurl,
+                    ocspoptions,
+                )
+            zeros = contents.hex().encode("utf-8")
+            # add some extra space to avoid problems with signature size
+            aligned = len(zeros) + 512
+            zeros += b"00" * aligned
+
+        params = {"mode": mode, "use_signingdate": use_signingdate}
+        if mode == "timestamp":
+            # the time comes from the token; /M only when given
+            params["use_signingdate"] = "signingdate" in udct
+        elif not tspurl:
+            params["use_signingdate"] = True
+
+        self._makepdf(
+            prev, udct, algomd, zeros, cert, othercerts, ocspurl, ocspoptions, **params
+        )
+
+        # ID[0] is used in password protection, must be unchanged
+        ID = prev.trailer.get("/ID", None)
+        if ID is None:
+            ID = udct.get("id") or secrets.token_bytes(16)
+        else:
+            ID = ID.get_object()[0].original_bytes
+        newID = udct.get("newid")
+        if newID is None:
+            id1_entry = secrets.token_bytes(16)
+        else:
+            id1_entry = hashlib.md5(newID.encode()).digest()
+        self._ID = po.ArrayObject(
+            [
+                po.ByteStringObject(ID),
+                po.ByteStringObject(id1_entry),
+            ]
+        )
+        # if document was encrypted, encrypt this version too
+        if prev.is_encrypted:
+            prev._encryption.id1_entry = id1_entry
+
+        fo = io.BytesIO()
+        self._write(fo, prev, startdata)
+        datas = fo.getvalue()
+
+        br = [0, 0, 0, 0]
+        bfrom = (b"[ " + b" ".join([_WNumberObject.Format] * 4) + b" ]") % tuple(br)
+
+        pdfbr1 = datas.find(zeros)
+        pdfbr2 = pdfbr1 + len(zeros)
+        br = [
+            0,
+            startdata + pdfbr1 - 1,
+            startdata + pdfbr2 + 1,
+            len(datas) - pdfbr2 - 1,
+        ]
+        bto = b"[%d %d %d %d]" % tuple(br)
+        bto += b" " * (len(bfrom) - len(bto))
+        if len(bfrom) != len(bto):
+            raise ValueError("ByteRange layout mismatch while updating PDF signature")
+        datas = datas.replace(bfrom, bto, 1)
+
+        md = getattr(hashlib, algomd)()
+        md.update(datau)
+        b1 = datas[: br[1] - startdata]
+        b2 = datas[br[2] - startdata :]
+        md.update(b1)
+        md.update(b2)
+        md = md.digest()
+
+        if mode == "timestamp":
+            response = signer.fetch_tsp_response(
+                b"",
+                algomd,
+                tspurl,
+                tspoptions,
+                prehashed=md,
+            )
+            if response is None:
+                raise TimestampError("No response from timestamp server")
+            tspresp = tsp.TimeStampResp.load(response)
+            if not signer.tsp_granted(tspresp):
+                raise TimestampError("Timestamp request was not granted")
+            contents = tspresp["time_stamp_token"].dump()
+        else:
+            attrs = udct.get("attrs", True)
+            pss = udct.get("pss", False)
+            contents = signer.sign(
+                None,
+                key,
+                cert,
+                othercerts,
+                algomd,
+                attrs,
+                md,
+                hsm,
+                pss,
+                tspurl,
+                tspoptions,
+                ocspurl,
+                ocspoptions,
+            )
+        contents = contents.hex().encode("utf-8")
+        nb = len(zeros) - len(contents)
+        if nb > 0:
+            contents += b"0" * nb
+        if len(zeros) != len(contents):
+            raise ValueError("Signature placeholder length mismatch while writing PDF")
+
+        datas = datas.replace(zeros, contents, 1)
+
+        return datas
+
+
+def timestamp(
+    datau: bytes,
+    udct: dict[str, Any],
+    algomd: str = "sha256",
+    tspurl: str | None = None,
+    tspoptions: dict[str, Any] | None = None,
+) -> bytes:
+    """
+    parameters:
+        datau: pdf bytes being timestamped
+        udct: dictionary with signing parameters
+            Same paramaters as the sign method.  The following parameters
+            should not be used as they are either unused or conflict with
+            normal timestamping:
+
+            - signform
+            - sigandcertify
+            - contact
+            - location
+            - signingdate
+            - reason
+
+            Timestamping also does not typically use signature appearances.
+            The following appearance options should probably be omitted,
+            but do not conflict with the normal timestamping operations.
+
+            - signaturebox
+            - signature
+            - signature_img
+            - signature_img_distort
+            - signature_img_centred
+            - signature_appearance
+            - signature_manual
+            - manual_fonts
+            - manual_images
+        algomd:string                   default: sha256 - name of the hashing algorithm used to calculate
+                                            the hash of the document being signed e.g.: sha1, sha256, sha384, sha512, ripemd160
+        hsm: an instance of endesive.hsm.HSM class used to sign using a hardware token or None
+        tspurl: timestamp server URL or None
+        tspoptions: Dict to set options to the POST http call against the timestamp server. Default: None
+
+    returns: bytes ready for writing after unsigned pdf document containing its electronic timestamp
+    """
+
+    cls = SignedData()
+    return cls.sign(
+        datau,
+        udct,
+        None,  # key,
+        None,  # cert,
+        None,  # othercerts,
+        algomd,
+        None,  # hsm,
+        tspurl,
+        tspoptions,
+        mode="timestamp",
+    )
+
+
+def sign(
+    datau: bytes,
+    udct: dict[str, Any],
+    key: Any,
+    cert: Any,
+    othercerts: list[Any],
+    algomd: str = "sha256",
+    hsm: Any = None,
+    tspurl: str | None = None,
+    tspoptions: dict[str, Any] | None = None,
+    ocspurl: str | None = None,
+    ocspoptions: dict[str, Any] | None = None,
+    use_signingdate: bool = True,
+) -> bytes:
+    """
+    Sign PDF file
+
+    parameters:
+        datau: pdf bytes being signed
+        udct: dictionary with signing parameters
+            aligned: int                if 0 then precompute size of signature, but first fake data will be signed
+                                        !=0 number of hexbytes (00) reserved for signature,
+                                            must be equal or greather than hex representation of signature
+                                            probably 16384 will be sufficient ....
+            sigflags: int               default:3 1,2,3 - flags for acroform
+            sigflagsft: int             default:132 - flags for annotation widget from pdf 12.5.3
+            sigpage: int                default:0 - page on which signature should appear
+            sigfield: string            default:Signature1
+            auto_sigfield: bool         default:False
+                                                False - do not check for sigfield name conflicts
+                                                True  - append and increment suffix to sigfield when a field
+                                                        by the name of sigfield already exists in AcroForm
+            signform: bool              default:False
+                                                False - do not fill in an existing form's signature field
+                                                True  - attach signature to the pre-existing Sig field by the
+                                                        the name provided by sigfield in AcroForm.  Use with
+                                                        signature or signature_img, will fill the signature
+                                                        field's widget, ignoring signaturebox.
+            sigandcertify: bool         default:False
+                                                False - sign only document
+                                                True  - sign and certify document
+            signaturebox: box|None      default:None - where to put signature image/string on selected page
+            signature: string                   if box is not None then it should be latin1 encodable string
+            signature_img: string|pil_image     if box is not None and string is None then it should be
+                                                    pil image instance or
+                                                    image file name or
+                                                    byte array of image
+            signature_img_distort: bool default:True
+                                                True  - do not maintain image aspect ratio, fill the
+                                                        entire bounding box, distorting the image.
+                                                        This is set to True to match the behaviour
+                                                        of previous versions of endesive
+                                                False - maintain image aspect ratio when fitting
+                                                        image into the bounding box
+            signature_img_centred: bool default:True
+                                                True  - centre images within the bounding box when
+                                                        image aspect ratio does not match that of
+                                                        the bounding box
+                                                False - do not centre image, position it at the
+                                                        lower-left of the bounding box
+            signature_appearance: dict  if box is not None then render a signature appearance that is
+                                            configured by the dict.  See below for configuration
+            signature_manual: list      if box is not None then render a manually-created signature
+                                        apperance using the directives contained in this list
+            manual_fonts: dict          fonts required by the manual signature appearance
+            manual_images: dict         images required by the manual signature appearance
+            contact: string             required info about the person signing the document
+            location:string             required info about location of the person signing the document
+            signingdate: string         required info about signing time eg: now.strftime('D:%Y%m%d%H%M%S+00\'00\'')
+            reason: string              required info about reason for signing the document
+            password: string            required if the document is password protected, signing it also requires that password
+            text: dict                  text attributes
+                                            wraptext=True, fontsize:12, textalign:'left', linespacing:1.2
+            application: string         optional application name in advanced signature properties dialog in Acrobat Reader
+            pss: boolen                 optional choosen signature scheme RSASSA-PSS (true) vs. PKCS1-v1_5 (false/default)
+        key: cryptography.hazmat.backends.openssl.rsa._RSAPrivateKey - private key used to sign the document
+        cert: cryptography.x509.Certificate - certificate associated with the key
+        othercerts: list of cryptography.x509.Certificate to be saved with the signed document,
+            e.g.: a list of intermediate certificates used to confirm the authenticity of the certificate used in the signature
+        algomd:string                   default: sha256 - name of the hashing algorithm used to calculate
+                                            the hash of the document being signed e.g.: sha1, sha256, sha384, sha512, ripemd160
+        hsm: an instance of endesive.hsm.HSM class used to sign using a hardware token or None
+        tspurl: timestamp server URL or None
+        tspoptions: Dict to set options to the POST http call against the timestamp server, when basic authorization is required include username and password. Default: None
+        ocsppurl: ocsp server URL or None
+        ocspoptions: Dict to set options to the POST http call against the OCSP server, certificate of issuer is under issuer key. Default: None
+        ltv: boolean enable LTV signature
+        use_signingdate: boolean include signingdate from udct in signer info block of pdf
+
+    returns: bytes ready for writing after unsigned pdf document containing its electronic signature
+
+    Signature appearance:
+
+    Adobe-inspired signature with text and images Parameters are contained
+    in udct['signature_appearance']
+
+    If a field is included in the display list, that field will be included
+    in the annotation.  Its value is based upon what is in udct and the cert.
+    Text and border are the colour specified by outline, and border is the
+    the inset distance from the outer edge of the annotation.  The R G B
+    values range between 0 and 1.
+
+    Icon is an image to display above the background and border at the
+    left-hand side of the anntoation.  If there is no text, it is centred.
+
+    The text block is left-aligned to the right of the icon image.  If there
+    is no image, the text is left-aliged with the left-hand border of the
+    annotation
+
+    display fields:
+        CN, DN, date, contact, reason, location
+
+    Dict format:
+      appearance = dict(
+          background = Image with alpha / None,
+          icon = Image with alpha / None,
+          labels = bool,
+          display = list,
+          software = str,
+          outline = [R, G, B],
+          border = int,
+          )
+
+    Signature manual:
+
+    Manually set up your own signature appearance with arbitrary fonts and
+    images.  The full list of directives can be seen in the template dict
+    in endesive.pdf.PyPDF2_annotate.annotations.signatureaSignatureAppearance
+
+    Coordinates are based off of the lower-left corner of the annotation
+
+    manual_images is a dict of images that will be included in the annotation
+    The keys are strings, and are the names to use when referring to the them
+    in 'image' directives.
+
+    manual_fonts is a dict of TrueType fonts that will be included in the
+    annotation.  The keys are strings, and are the names to use when referring
+    to the them in 'image' directives.  The values are the paths to the font
+    files.  Do not use the name 'default' in this dict; it is treated
+    specially.
+
+    """
+    cls = SignedData()
+    return cls.sign(
+        datau,
+        udct,
+        key,
+        cert,
+        othercerts,
+        algomd,
+        hsm,
+        tspurl,
+        tspoptions,
+        "sign",
+        ocspurl,
+        ocspoptions,
+        use_signingdate,
+    )
